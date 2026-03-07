@@ -1,0 +1,262 @@
+name: Release
+
+on:
+  push:
+    branches:
+      - "release/v*"
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: "-Dwarnings"
+
+jobs:
+  # ── Gate: run full CI first ──────────────────────────────────────────
+  ci-gate:
+    name: CI Gate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Clippy
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: Rustfmt
+        run: cargo fmt --all -- --check
+
+      - name: Build
+        run: cargo build
+
+      - name: Test
+        run: cargo test
+
+  # ── Extract version from branch name ─────────────────────────────────
+  version:
+    name: Extract Version
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.extract.outputs.version }}
+      version_bare: ${{ steps.extract.outputs.version_bare }}
+    steps:
+      - name: Extract version from branch
+        id: extract
+        run: |
+          BRANCH="${GITHUB_REF#refs/heads/}"
+          VERSION="${BRANCH#release/}"
+          VERSION_BARE="${VERSION#v}"
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "version_bare=${VERSION_BARE}" >> "$GITHUB_OUTPUT"
+          echo "Branch: ${BRANCH}"
+          echo "Version: ${VERSION}"
+          echo "Version (bare): ${VERSION_BARE}"
+
+  # ── Build Android .so files ──────────────────────────────────────────
+  build-android:
+    name: Build Android
+    needs: [ci-gate, version]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android,armv7-linux-androideabi,x86_64-linux-android
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install cargo-ndk
+        run: cargo install cargo-ndk
+
+      - name: Setup Android NDK
+        uses: android-actions/setup-android@v3
+
+      - name: Build Android targets
+        run: |
+          for target in aarch64-linux-android armv7-linux-androideabi x86_64-linux-android; do
+            echo "Building for $target..."
+            cargo ndk --target "$target" build --release
+          done
+
+      - name: Collect jniLibs
+        run: |
+          mkdir -p artifacts/jniLibs/arm64-v8a
+          mkdir -p artifacts/jniLibs/armeabi-v7a
+          mkdir -p artifacts/jniLibs/x86_64
+          cp target/aarch64-linux-android/release/libhexatune_dsp_ffi.so artifacts/jniLibs/arm64-v8a/
+          cp target/armv7-linux-androideabi/release/libhexatune_dsp_ffi.so artifacts/jniLibs/armeabi-v7a/
+          cp target/x86_64-linux-android/release/libhexatune_dsp_ffi.so artifacts/jniLibs/x86_64/
+
+      - name: Upload Android artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: android-libs
+          path: artifacts/jniLibs/
+
+  # ── Build iOS .a files + XCFramework ─────────────────────────────────
+  build-ios:
+    name: Build iOS
+    needs: [ci-gate, version]
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-ios,aarch64-apple-ios-sim
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build iOS targets
+        run: |
+          cargo build --release --target aarch64-apple-ios
+          cargo build --release --target aarch64-apple-ios-sim
+
+      - name: Create XCFramework
+        run: |
+          xcodebuild -create-xcframework \
+            -library target/aarch64-apple-ios/release/libhexatune_dsp_ffi.a \
+            -headers include/ \
+            -library target/aarch64-apple-ios-sim/release/libhexatune_dsp_ffi.a \
+            -headers include/ \
+            -output artifacts/HexaTuneDsp.xcframework
+
+      - name: Upload iOS artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: ios-framework
+          path: artifacts/HexaTuneDsp.xcframework/
+
+  # ── Build Linux host .so ─────────────────────────────────────────────
+  build-linux:
+    name: Build Linux
+    needs: [ci-gate, version]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build release
+        run: cargo build --release
+
+      - name: Collect artifacts
+        run: |
+          mkdir -p artifacts
+          cp target/release/libhexatune_dsp_ffi.so artifacts/
+          cp target/release/libhexatune_dsp_ffi.a artifacts/
+          cp include/hexatune_dsp_ffi.h artifacts/
+
+      - name: Upload Linux artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-libs
+          path: artifacts/
+
+  # ── Publish & Release ────────────────────────────────────────────────
+  release:
+    name: Create GitHub Release
+    needs: [version, build-android, build-ios, build-linux]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Update Cargo.toml version
+        run: |
+          VERSION_BARE="${{ needs.version.outputs.version_bare }}"
+          echo "Updating version to ${VERSION_BARE}..."
+          sed -i "s/^version = \".*\"/version = \"${VERSION_BARE}\"/" Cargo.toml
+          echo "Version set to:"
+          grep '^version' Cargo.toml
+
+      - name: Commit version bump
+        run: |
+          VERSION="${{ needs.version.outputs.version }}"
+          VERSION_BARE="${{ needs.version.outputs.version_bare }}"
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add Cargo.toml Cargo.lock
+          git diff --cached --quiet || git commit -m "release: bump version to ${VERSION_BARE}"
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist/
+
+      - name: Package artifacts
+        run: |
+          VERSION="${{ needs.version.outputs.version }}"
+
+          # Android
+          cd dist/android-libs
+          tar czf "../hexatune-dsp-ffi-${VERSION}-android.tar.gz" .
+          cd ../..
+
+          # iOS
+          cd dist/ios-framework
+          tar czf "../hexatune-dsp-ffi-${VERSION}-ios.tar.gz" .
+          cd ../..
+
+          # Linux
+          cd dist/linux-libs
+          tar czf "../hexatune-dsp-ffi-${VERSION}-linux-x86_64.tar.gz" .
+          cd ../..
+
+          ls -lh dist/*.tar.gz
+
+      - name: Generate changelog
+        run: |
+          VERSION="${{ needs.version.outputs.version }}"
+          {
+            echo "## ${VERSION}"
+            echo ""
+            echo "### Release Artifacts"
+            echo ""
+            echo "| Platform | File |"
+            echo "|----------|------|"
+            echo "| Android (arm64-v8a, armeabi-v7a, x86_64) | \`hexatune-dsp-ffi-${VERSION}-android.tar.gz\` |"
+            echo "| iOS (XCFramework) | \`hexatune-dsp-ffi-${VERSION}-ios.tar.gz\` |"
+            echo "| Linux (x86_64) | \`hexatune-dsp-ffi-${VERSION}-linux-x86_64.tar.gz\` |"
+            echo ""
+            echo "### Commits since last tag"
+            echo ""
+            PREVIOUS_TAG=$(git describe --tags --abbrev=0 2>/dev/null || echo "")
+            if [ -n "$PREVIOUS_TAG" ]; then
+              git log "${PREVIOUS_TAG}..HEAD" --oneline --no-merges | sed 's/^/- /'
+            else
+              git log --oneline --no-merges -20 | sed 's/^/- /'
+            fi
+          } > RELEASE_NOTES.md
+          cat RELEASE_NOTES.md
+
+      - name: Create git tag and push
+        run: |
+          VERSION="${{ needs.version.outputs.version }}"
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git tag -a "${VERSION}" -m "Release ${VERSION}"
+          git push origin HEAD "${VERSION}"
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.version.outputs.version }}
+          name: hexatune-dsp-ffi ${{ needs.version.outputs.version }}
+          body_path: RELEASE_NOTES.md
+          files: dist/*.tar.gz
+          draft: false
+          prerelease: false
