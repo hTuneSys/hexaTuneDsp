@@ -76,7 +76,10 @@ mod tests {
             let s = osc.next_sample();
             max_val = max_val.max(s.abs());
         }
-        assert!(max_val > 0.99, "peak amplitude should be ~1.0, got {max_val}");
+        assert!(
+            max_val > 0.99,
+            "peak amplitude should be ~1.0, got {max_val}"
+        );
     }
 
     #[test]
@@ -99,10 +102,7 @@ mod tests {
         let mut osc = Oscillator::new(1000.0, 48000.0);
         for _ in 0..96000 {
             let s = osc.next_sample();
-            assert!(
-                (-1.0..=1.0).contains(&s),
-                "sample out of range: {s}"
-            );
+            assert!((-1.0..=1.0).contains(&s), "sample out of range: {s}");
         }
     }
 }

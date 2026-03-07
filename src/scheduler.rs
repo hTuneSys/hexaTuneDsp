@@ -99,10 +99,7 @@ impl Scheduler {
     /// Reset to the beginning of the cycle.
     pub fn reset(&mut self) {
         self.current_index = 0;
-        self.current_delta = self
-            .items
-            .first()
-            .map_or(0.0, |item| item.frequency_delta);
+        self.current_delta = self.items.first().map_or(0.0, |item| item.frequency_delta);
         self.samples_remaining = self
             .items
             .first()
@@ -186,12 +183,10 @@ mod tests {
 
     #[test]
     fn set_items_resets_state() {
-        let items = vec![
-            CycleItem {
-                frequency_delta: 3.0,
-                duration_seconds: 1.0,
-            },
-        ];
+        let items = vec![CycleItem {
+            frequency_delta: 3.0,
+            duration_seconds: 1.0,
+        }];
         let mut sched = Scheduler::new(items, 48000.0);
 
         // Advance partway
