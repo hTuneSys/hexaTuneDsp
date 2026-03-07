@@ -54,8 +54,7 @@ impl BinauralGenerator {
     #[inline]
     pub fn set_delta(&mut self, delta: f32) {
         self.delta = delta;
-        self.right_osc
-            .set_frequency(self.carrier_frequency + delta);
+        self.right_osc.set_frequency(self.carrier_frequency + delta);
         self.mod_osc.set_frequency(delta);
     }
 

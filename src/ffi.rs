@@ -23,7 +23,9 @@
 use std::ffi::CStr;
 use std::os::raw::c_char;
 
-use crate::engine::{Engine, EngineConfig, PendingConfig, DEFAULT_RAIN_GAIN, DEFAULT_SAMPLE_RATE, DEFAULT_TONE_GAIN};
+use crate::engine::{
+    DEFAULT_RAIN_GAIN, DEFAULT_SAMPLE_RATE, DEFAULT_TONE_GAIN, Engine, EngineConfig, PendingConfig,
+};
 use crate::scheduler::CycleItem;
 
 // ---------------------------------------------------------------------------
@@ -98,11 +100,7 @@ unsafe fn ffi_config_to_rust(config: *const HtdEngineConfig) -> Result<EngineCon
         None
     } else {
         let cstr = unsafe { CStr::from_ptr(cfg.rain_sound_path) };
-        Some(
-            cstr.to_str()
-                .map_err(|_| HtdError::InvalidUtf8)?
-                .to_owned(),
-        )
+        Some(cstr.to_str().map_err(|_| HtdError::InvalidUtf8)?.to_owned())
     };
 
     let cycle_items = if cfg.cycle_items.is_null() || cfg.cycle_count == 0 {
@@ -366,10 +364,7 @@ pub unsafe extern "C" fn htd_engine_update_config(
 /// - `path` must be a valid null-terminated UTF-8 string.
 /// - Must not be called concurrently with [`htd_engine_render`].
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn htd_engine_load_rain(
-    engine: *mut HtdEngine,
-    path: *const c_char,
-) -> i32 {
+pub unsafe extern "C" fn htd_engine_load_rain(engine: *mut HtdEngine, path: *const c_char) -> i32 {
     if engine.is_null() || path.is_null() {
         return HtdError::NullPointer as i32;
     }

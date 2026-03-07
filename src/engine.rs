@@ -7,8 +7,8 @@
 //! and mixer into a single render pipeline. The render path is fully
 //! real-time safe: no heap allocation, no I/O, no locks.
 
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 use crate::binaural::BinauralGenerator;
 use crate::mixer::Mixer;
@@ -379,7 +379,10 @@ mod tests {
         engine.render(&mut buf2, 100);
 
         // Buffers should be different (different carrier frequency)
-        let differ = buf1.iter().zip(buf2.iter()).any(|(a, b)| (a - b).abs() > 1e-6);
+        let differ = buf1
+            .iter()
+            .zip(buf2.iter())
+            .any(|(a, b)| (a - b).abs() > 1e-6);
         assert!(differ, "config update should change the audio output");
     }
 
