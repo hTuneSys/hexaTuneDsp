@@ -1,0 +1,25 @@
+[package]
+name = "hexatune-dsp-ffi"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+authors = ["hexaTune LLC"]
+repository = "https://github.com/hTuneSys/hexaTuneDsp"
+description = "HexaTune real-time DSP audio engine with C-compatible FFI for Flutter"
+categories = ["multimedia::audio", "api-bindings"]
+keywords = ["audio", "dsp", "binaural", "ffi", "flutter"]
+
+[lib]
+crate-type = ["cdylib", "staticlib", "lib"]
+
+[dependencies]
+hound = "3.5"
+
+[build-dependencies]
+cbindgen = "0.29"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+strip = "symbols"
