@@ -14,14 +14,48 @@
 #define DEFAULT_SAMPLE_RATE 48000.0
 
 /**
- * Default rain gain.
+ * Maximum number of texture layers.
  */
-#define DEFAULT_RAIN_GAIN 0.8
+#define MAX_TEXTURE_LAYERS 3
 
 /**
- * Default tone gain.
+ * Maximum number of event slots.
  */
-#define DEFAULT_TONE_GAIN 0.2
+#define MAX_EVENT_SLOTS 5
+
+/**
+ * Default gain values for each layer.
+ */
+#define DEFAULT_BASE_GAIN 0.6
+
+#define DEFAULT_TEXTURE_GAIN 0.3
+
+#define DEFAULT_EVENT_GAIN 0.4
+
+#define DEFAULT_BINAURAL_GAIN 0.15
+
+#define DEFAULT_MASTER_GAIN 1.0
+
+/**
+ * Default crossfade length in sample frames (~42 ms at 48 kHz).
+ */
+#define DEFAULT_CROSSFADE_FRAMES 2048
+
+/**
+ * Error codes returned by FFI functions.
+ */
+enum HtdError {
+  Ok = 0,
+  NullPointer = -1,
+  InvalidConfig = -2,
+  InitFailed = -3,
+  InvalidUtf8 = -4,
+  BufferTooSmall = -5,
+  LoadFailed = -6,
+  LayerLimitExceeded = -7,
+  BaseRequired = -8,
+};
+typedef int32_t HtdError;
 
 /**
  * The main DSP audio engine.
@@ -57,10 +91,6 @@ typedef struct HtdEngineConfig {
   float carrier_frequency;
   bool binaural_enabled;
   /**
-   * Null-terminated UTF-8 path, or null if no rain sound.
-   */
-  const char *rain_sound_path;
-  /**
    * Pointer to an array of cycle items.
    */
   const struct HtdCycleItem *cycle_items;
@@ -69,9 +99,72 @@ typedef struct HtdEngineConfig {
    */
   uint32_t cycle_count;
   float sample_rate;
-  float rain_gain;
-  float tone_gain;
+  float base_gain;
+  float texture_gain;
+  float event_gain;
+  float binaural_gain;
+  float master_gain;
 } HtdEngineConfig;
+
+/**
+ * Audio layer configuration (raw PCM data).
+ */
+typedef struct HtdLayerConfig {
+  /**
+   * Pointer to interleaved f32 PCM samples.
+   */
+  const float *samples;
+  /**
+   * Number of sample frames (not individual samples).
+   */
+  uint32_t num_frames;
+  /**
+   * Number of channels: 1 (mono) or 2 (stereo interleaved).
+   */
+  uint32_t channels;
+} HtdLayerConfig;
+
+/**
+ * Random event configuration.
+ */
+typedef struct HtdEventConfig {
+  /**
+   * Pointer to interleaved f32 PCM samples.
+   */
+  const float *samples;
+  /**
+   * Number of sample frames.
+   */
+  uint32_t num_frames;
+  /**
+   * Number of channels: 1 (mono) or 2 (stereo interleaved).
+   */
+  uint32_t channels;
+  /**
+   * Minimum interval between triggers in milliseconds.
+   */
+  uint32_t min_interval_ms;
+  /**
+   * Maximum interval between triggers in milliseconds.
+   */
+  uint32_t max_interval_ms;
+  /**
+   * Minimum playback volume (0.0–1.0).
+   */
+  float volume_min;
+  /**
+   * Maximum playback volume (0.0–1.0).
+   */
+  float volume_max;
+  /**
+   * Minimum stereo pan (-1.0 = left, 1.0 = right).
+   */
+  float pan_min;
+  /**
+   * Maximum stereo pan (-1.0 = left, 1.0 = right).
+   */
+  float pan_max;
+} HtdEventConfig;
 
 /**
  * A stereo audio frame (used for documentation / cbindgen export).
@@ -106,8 +199,7 @@ HtdEngine *htd_engine_init(const struct HtdEngineConfig *config, int32_t *out_er
 void htd_engine_destroy(HtdEngine *engine);
 
 /**
- * Start audio generation. After this call, [`htd_engine_render`] will
- * produce audio samples instead of silence.
+ * Start audio generation.
  *
  * # Safety
  *
@@ -127,13 +219,9 @@ int32_t htd_engine_stop(HtdEngine *engine);
 /**
  * Render `num_frames` of interleaved stereo f32 audio into `output`.
  *
- * The output buffer must hold at least `num_frames * 2` floats
- * (left, right, left, right, ...).
- *
  * # Real-time safety
  *
- * This function is safe to call from an audio callback. It does not
- * allocate, does not perform I/O, and does not block.
+ * Safe to call from an audio callback.
  *
  * # Safety
  *
@@ -144,35 +232,136 @@ int32_t htd_engine_stop(HtdEngine *engine);
 int32_t htd_engine_render(HtdEngine *engine, float *output, uint32_t num_frames);
 
 /**
- * Set the rain/ambient gain level. Can be called from any thread.
+ * Set the base ambient layer from raw PCM data.
+ *
+ * # Safety
+ *
+ * - `engine` must be a valid engine pointer.
+ * - `config` must point to a valid `HtdLayerConfig` with valid `samples`.
+ * - Must not be called concurrently with [`htd_engine_render`].
+ */
+int32_t htd_engine_set_base(HtdEngine *engine, const struct HtdLayerConfig *config);
+
+/**
+ * Remove the base layer and all dependent layers (textures, events).
+ *
+ * # Safety
+ *
+ * `engine` must be a valid engine pointer.
+ * Must not be called concurrently with [`htd_engine_render`].
+ */
+int32_t htd_engine_clear_base(HtdEngine *engine);
+
+/**
+ * Set a texture layer at the given index (0–2).
+ *
+ * # Safety
+ *
+ * - `engine` must be a valid engine pointer.
+ * - `config` must point to valid `HtdLayerConfig`.
+ * - Must not be called concurrently with [`htd_engine_render`].
+ */
+int32_t htd_engine_set_texture(HtdEngine *engine,
+                               uint32_t index,
+                               const struct HtdLayerConfig *config);
+
+/**
+ * Remove a texture layer at the given index.
+ *
+ * # Safety
+ *
+ * `engine` must be a valid engine pointer.
+ * Must not be called concurrently with [`htd_engine_render`].
+ */
+int32_t htd_engine_clear_texture(HtdEngine *engine, uint32_t index);
+
+/**
+ * Register a random event at the given index (0–4).
+ *
+ * # Safety
+ *
+ * - `engine` must be a valid engine pointer.
+ * - `config` must point to valid `HtdEventConfig`.
+ * - Must not be called concurrently with [`htd_engine_render`].
+ */
+int32_t htd_engine_set_event(HtdEngine *engine,
+                             uint32_t index,
+                             const struct HtdEventConfig *config);
+
+/**
+ * Remove a random event at the given index.
+ *
+ * # Safety
+ *
+ * `engine` must be a valid engine pointer.
+ * Must not be called concurrently with [`htd_engine_render`].
+ */
+int32_t htd_engine_clear_event(HtdEngine *engine, uint32_t index);
+
+/**
+ * Remove all layers (base, textures, events). Binaural is unaffected.
+ *
+ * # Safety
+ *
+ * `engine` must be a valid engine pointer.
+ * Must not be called concurrently with [`htd_engine_render`].
+ */
+int32_t htd_engine_clear_all_layers(HtdEngine *engine);
+
+/**
+ * Set the base layer gain. Thread-safe (atomic).
  *
  * # Safety
  *
  * `engine` must be a valid engine pointer.
  */
-int32_t htd_engine_set_rain_gain(HtdEngine *engine, float gain);
+int32_t htd_engine_set_base_gain(HtdEngine *engine, float gain);
 
 /**
- * Set the tone gain level. Can be called from any thread.
+ * Set the texture layer gain. Thread-safe (atomic).
  *
  * # Safety
  *
  * `engine` must be a valid engine pointer.
  */
-int32_t htd_engine_set_tone_gain(HtdEngine *engine, float gain);
+int32_t htd_engine_set_texture_gain(HtdEngine *engine, float gain);
 
 /**
- * Update the engine configuration at runtime. Changes are applied on the
- * next render call. This function may be called from any thread.
+ * Set the event layer gain. Thread-safe (atomic).
  *
- * Fields in the config are applied as follows:
+ * # Safety
+ *
+ * `engine` must be a valid engine pointer.
+ */
+int32_t htd_engine_set_event_gain(HtdEngine *engine, float gain);
+
+/**
+ * Set the binaural/tone layer gain. Thread-safe (atomic).
+ *
+ * # Safety
+ *
+ * `engine` must be a valid engine pointer.
+ */
+int32_t htd_engine_set_binaural_gain(HtdEngine *engine, float gain);
+
+/**
+ * Set the master output gain. Thread-safe (atomic).
+ *
+ * # Safety
+ *
+ * `engine` must be a valid engine pointer.
+ */
+int32_t htd_engine_set_master_gain(HtdEngine *engine, float gain);
+
+/**
+ * Update the engine binaural configuration at runtime.
+ *
+ * Fields applied:
  * - `carrier_frequency`: updated if > 0
  * - `binaural_enabled`: always applied
- * - `cycle_items` / `cycle_count`: updated if `cycle_items` is non-null
- *   and `cycle_count` > 0
+ * - `cycle_items` / `cycle_count`: updated if non-null and count > 0
  *
- * `rain_sound_path`, `sample_rate`, and gain fields are ignored.
- * Use dedicated setters for gains.
+ * Gain fields and `sample_rate` are ignored — use dedicated setters.
  *
  * # Safety
  *
@@ -181,10 +370,9 @@ int32_t htd_engine_set_tone_gain(HtdEngine *engine, float gain);
 int32_t htd_engine_update_config(HtdEngine *engine, const struct HtdEngineConfig *config);
 
 /**
- * Load a rain/ambient sound from a WAV file.
+ * Load a base layer from a WAV file (convenience function).
  *
- * This function allocates memory and performs I/O. It must NOT be called
- * from an audio callback.
+ * This allocates memory and performs I/O.
  *
  * # Safety
  *
@@ -192,7 +380,7 @@ int32_t htd_engine_update_config(HtdEngine *engine, const struct HtdEngineConfig
  * - `path` must be a valid null-terminated UTF-8 string.
  * - Must not be called concurrently with [`htd_engine_render`].
  */
-int32_t htd_engine_load_rain(HtdEngine *engine, const char *path);
+int32_t htd_engine_load_base_wav(HtdEngine *engine, const char *path);
 
 /**
  * Query whether the engine is currently running.

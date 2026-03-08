@@ -10,6 +10,9 @@ include = [
     "HtdEngineConfig",
     "HtdCycleItem",
     "HtdStereoFrame",
+    "HtdLayerConfig",
+    "HtdEventConfig",
+    "HtdError",
 ]
 
 [fn]

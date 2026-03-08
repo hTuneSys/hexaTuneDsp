@@ -23,8 +23,10 @@
 
 pub mod binaural;
 pub mod engine;
+pub mod event_player;
+pub mod event_scheduler;
 pub mod ffi;
 pub mod mixer;
 pub mod oscillator;
-pub mod rain_player;
+pub mod sample_player;
 pub mod scheduler;

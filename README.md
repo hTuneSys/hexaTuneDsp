@@ -1,8 +1,8 @@
 # hexaTuneDsp
 
-Real-time audio synthesis engine written in Rust with a C-compatible FFI interface for Flutter.
+Real-time multi-layer soundscape engine written in Rust with a C-compatible FFI interface for Flutter.
 
-Generates binaural beats, amplitude-modulated tones, and mixes in ambient audio (rain, white noise, etc.) with timed frequency cycle scheduling — all in a real-time safe render loop with zero allocations during playback.
+Generates binaural beats, amplitude-modulated tones, and mixes in multiple ambient layers — base, texture, and random events — with timed frequency cycle scheduling. All processing is real-time safe with zero allocations during playback.
 
 ---
 
@@ -17,7 +17,8 @@ Generates binaural beats, amplitude-modulated tones, and mixes in ambient audio 
   - [Types](#types)
   - [Lifecycle Functions](#lifecycle-functions)
   - [Audio Rendering](#audio-rendering)
-  - [Parameter Control](#parameter-control)
+  - [Layer Management](#layer-management)
+  - [Gain Control](#gain-control)
   - [Configuration Update](#configuration-update)
   - [Error Codes](#error-codes)
 - [Flutter Integration (Dart)](#flutter-integration-dart)
@@ -26,7 +27,7 @@ Generates binaural beats, amplitude-modulated tones, and mixes in ambient audio 
   - [Binaural Mode](#binaural-mode)
   - [AM Mode (Non-Binaural)](#am-mode-non-binaural)
   - [Frequency Cycle Scheduling](#frequency-cycle-scheduling)
-  - [Rain / Ambient Sound](#rain--ambient-sound)
+  - [Layer System](#layer-system)
   - [Mixer](#mixer)
 - [Real-Time Safety](#real-time-safety)
 - [Cross-Compilation](#cross-compilation)
@@ -36,10 +37,14 @@ Generates binaural beats, amplitude-modulated tones, and mixes in ambient audio 
 
 ## Features
 
+- **Multi-layer soundscape** — base, texture (x3), random events (x5), and binaural/AM layers
 - **Binaural beat generation** — stereo output with different frequencies per ear
 - **Amplitude modulation fallback** — mono pulsing mode when binaural is disabled
-- **Ambient sound mixing** — loops pre-loaded WAV audio (rain, white noise, etc.)
+- **Random event scheduling** — sample-accurate PRNG-based one-shot sounds with randomized volume/pan
+- **Loop crossfade** — seamless looping with configurable crossfade region
 - **Timed frequency cycles** — automatically rotates through frequency deltas on a schedule
+- **Per-layer gain control** — base, texture, event, binaural, and master gains (all atomic/thread-safe)
+- **Layer validation** — texture/event layers require a base layer to be set
 - **C-compatible FFI** — works with any language that supports C FFI (Dart, Swift, Kotlin, C++)
 - **Real-time safe** — zero allocations, zero I/O, zero locks in the audio callback
 - **Auto-generated C header** — `include/hexatune_dsp_ffi.h` via cbindgen
@@ -49,23 +54,32 @@ Generates binaural beats, amplitude-modulated tones, and mixes in ambient audio 
 ## Architecture
 
 ```
-Flutter UI Layer          (Dart — UI, state management, presets)
-       ↓
-Flutter Control Layer     (Dart — calls FFI functions)
-       ↓
+Flutter UI Layer          (Dart — UI, state management, scene presets)
+       |
+Flutter Control Layer     (Dart — decodes .m4a to PCM f32, calls FFI)
+       |
 Rust FFI Bridge           (src/ffi.rs — extern "C" functions, no DSP logic)
-       ↓
-Rust DSP Engine           (src/engine.rs — orchestrates all audio modules)
-       ↓
- ┌─────────────┬───────────────┬────────────────┬──────────┐
- │ Oscillator  │   Binaural    │  Rain Player   │ Scheduler│
- │ (sine wave) │ (stereo/AM)   │ (WAV looping)  │ (cycles) │
- └─────────────┴───────────────┴────────────────┴──────────┘
-                        ↓
-                      Mixer  →  interleaved stereo f32 output
+       |
+Rust DSP Engine           (src/engine.rs — orchestrates all audio layers)
+       |
+ +-------------+---------------+----------------+-----------------+----------+
+ |  Oscillator  |   Binaural    | SamplePlayer   | EventSystem     | Scheduler|
+ |  (sine wave) | (stereo/AM)   | (loop+xfade)   | (PRNG one-shot) | (cycles) |
+ +-------------+---------------+----------------+-----------------+----------+
+                          |
+                        Mixer  ->  interleaved stereo f32 output
 ```
 
-Flutter sends control commands. Rust generates all audio.
+**Layer stack (per frame):**
+
+```
+binaural x binaural_gain    (always available)
+base     x base_gain        (0 or 1 continuous loop)
+textures x texture_gain     (0-3 continuous loops, summed)
+events   x event_gain       (0-5 definitions, max 1 playing at a time)
+---
+  sum x master_gain -> clamp to [-1.0, 1.0]
+```
 
 ---
 
@@ -82,12 +96,14 @@ hexaTuneDsp/
 │   ├── lib.rs              # Module declarations
 │   ├── oscillator.rs       # Phase-accumulator sine oscillator
 │   ├── binaural.rs         # Binaural beat / AM tone generator
-│   ├── rain_player.rs      # WAV file loader + looping playback
+│   ├── sample_player.rs    # PCM loop player with crossfade
+│   ├── event_player.rs     # Random one-shot event system
+│   ├── event_scheduler.rs  # PRNG-based event timing (Xorshift64)
 │   ├── scheduler.rs        # Frequency delta cycle scheduler
-│   ├── mixer.rs            # Stereo audio mixer
+│   ├── mixer.rs            # Multi-layer stereo mixer
 │   ├── engine.rs           # Main DSP engine orchestrator
 │   └── ffi.rs              # C-compatible FFI interface
-└── ARCHITECTURE.md         # Detailed architecture specification
+└── AGENTS.md               # AI agent coding rules
 ```
 
 ---
@@ -160,19 +176,51 @@ typedef struct HtdCycleItem {
 
 #### `HtdEngineConfig`
 
-Configuration for engine initialization and runtime updates.
+Configuration for engine initialization.
 
 ```c
 typedef struct HtdEngineConfig {
     float carrier_frequency;              // Base frequency in Hz (e.g. 400.0)
     bool binaural_enabled;                // true = binaural, false = AM mode
-    const char *rain_sound_path;          // Path to WAV file, or NULL
     const HtdCycleItem *cycle_items;      // Array of cycle steps
     uint32_t cycle_count;                 // Number of cycle items
     float sample_rate;                    // Sample rate (default: 48000)
-    float rain_gain;                      // Rain volume 0.0–1.0 (default: 0.8)
-    float tone_gain;                      // Tone volume 0.0–1.0 (default: 0.2)
+    float base_gain;                      // Base layer gain (default: 0.6)
+    float texture_gain;                   // Texture layer gain (default: 0.3)
+    float event_gain;                     // Event layer gain (default: 0.4)
+    float binaural_gain;                  // Binaural gain (default: 0.15)
+    float master_gain;                    // Master output gain (default: 1.0)
 } HtdEngineConfig;
+```
+
+#### `HtdLayerConfig`
+
+Raw PCM audio data for base or texture layers.
+
+```c
+typedef struct HtdLayerConfig {
+    const float *samples;   // Interleaved f32 PCM data
+    uint32_t num_frames;    // Number of sample frames
+    uint32_t channels;      // 1 (mono) or 2 (stereo interleaved)
+} HtdLayerConfig;
+```
+
+#### `HtdEventConfig`
+
+Configuration for a random one-shot event.
+
+```c
+typedef struct HtdEventConfig {
+    const float *samples;         // Interleaved f32 PCM data
+    uint32_t num_frames;          // Number of sample frames
+    uint32_t channels;            // 1 (mono) or 2 (stereo interleaved)
+    uint32_t min_interval_ms;     // Min time between triggers (ms)
+    uint32_t max_interval_ms;     // Max time between triggers (ms)
+    float volume_min;             // Min random volume (0.0-1.0)
+    float volume_max;             // Max random volume (0.0-1.0)
+    float pan_min;                // Min stereo pan (-1.0 left to 1.0 right)
+    float pan_max;                // Max stereo pan (-1.0 left to 1.0 right)
+} HtdEventConfig;
 ```
 
 ### Lifecycle Functions
@@ -187,7 +235,6 @@ HtdEngine *htd_engine_init(const HtdEngineConfig *config, int32_t *out_error);
 
 - Returns an opaque `HtdEngine*` pointer on success, `NULL` on failure.
 - Error code is written to `out_error` (pass `NULL` to ignore).
-- Loads the rain WAV file if `rain_sound_path` is non-null.
 
 #### `htd_engine_destroy`
 
@@ -247,40 +294,94 @@ int32_t htd_engine_render(HtdEngine *engine, float *output, uint32_t num_frames)
 - Call this from your platform audio callback.
 - Returns `0` on success.
 
-### Parameter Control
+### Layer Management
 
-#### `htd_engine_set_rain_gain`
+#### `htd_engine_set_base`
 
-Set the rain/ambient volume level. Thread-safe (uses atomics).
-
-```c
-int32_t htd_engine_set_rain_gain(HtdEngine *engine, float gain);  // 0.0–1.0
-```
-
-#### `htd_engine_set_tone_gain`
-
-Set the tone volume level. Thread-safe (uses atomics).
+Set the base ambient layer from raw PCM data.
 
 ```c
-int32_t htd_engine_set_tone_gain(HtdEngine *engine, float gain);  // 0.0–1.0
+int32_t htd_engine_set_base(HtdEngine *engine, const HtdLayerConfig *config);
 ```
 
-#### `htd_engine_load_rain`
+- The base layer is required before adding textures or events.
+- Not real-time safe — must not be called during `htd_engine_render`.
 
-Load or replace the ambient sound from a WAV file.
+#### `htd_engine_clear_base`
+
+Remove the base layer. Also clears all textures and events (they depend on base).
 
 ```c
-int32_t htd_engine_load_rain(HtdEngine *engine, const char *path);
+int32_t htd_engine_clear_base(HtdEngine *engine);
 ```
 
-- **Not real-time safe** — allocates memory, performs I/O.
-- Must not be called concurrently with `htd_engine_render`.
+#### `htd_engine_set_texture`
+
+Set a texture layer at index 0-2. Requires base to be set.
+
+```c
+int32_t htd_engine_set_texture(HtdEngine *engine, uint32_t index, const HtdLayerConfig *config);
+```
+
+#### `htd_engine_clear_texture`
+
+Remove a texture layer at the given index.
+
+```c
+int32_t htd_engine_clear_texture(HtdEngine *engine, uint32_t index);
+```
+
+#### `htd_engine_set_event`
+
+Register a random event at index 0-4. Requires base to be set.
+
+```c
+int32_t htd_engine_set_event(HtdEngine *engine, uint32_t index, const HtdEventConfig *config);
+```
+
+#### `htd_engine_clear_event`
+
+Remove a random event at the given index.
+
+```c
+int32_t htd_engine_clear_event(HtdEngine *engine, uint32_t index);
+```
+
+#### `htd_engine_clear_all_layers`
+
+Remove all layers (base, textures, events). Binaural is not affected.
+
+```c
+int32_t htd_engine_clear_all_layers(HtdEngine *engine);
+```
+
+#### `htd_engine_load_base_wav`
+
+Load the base layer from a WAV file (convenience function).
+
+```c
+int32_t htd_engine_load_base_wav(HtdEngine *engine, const char *path);
+```
+
+- Not real-time safe — allocates memory, performs I/O.
+
+### Gain Control
+
+All gain setters are thread-safe (use atomics). Can be called from any thread.
+
+```c
+int32_t htd_engine_set_base_gain(HtdEngine *engine, float gain);
+int32_t htd_engine_set_texture_gain(HtdEngine *engine, float gain);
+int32_t htd_engine_set_event_gain(HtdEngine *engine, float gain);
+int32_t htd_engine_set_binaural_gain(HtdEngine *engine, float gain);
+int32_t htd_engine_set_master_gain(HtdEngine *engine, float gain);
+```
 
 ### Configuration Update
 
 #### `htd_engine_update_config`
 
-Update engine parameters at runtime. Changes are applied on the next render call.
+Update binaural parameters at runtime. Changes are applied on the next render call.
 
 ```c
 int32_t htd_engine_update_config(HtdEngine *engine, const HtdEngineConfig *config);
@@ -289,42 +390,34 @@ int32_t htd_engine_update_config(HtdEngine *engine, const HtdEngineConfig *confi
 - `carrier_frequency`: applied if > 0
 - `binaural_enabled`: always applied
 - `cycle_items` + `cycle_count`: applied if non-null and count > 0
-- `rain_sound_path`, `sample_rate`, gain fields are **ignored** (use dedicated setters)
+- Gain fields and `sample_rate` are **ignored** — use dedicated setters.
 - Thread-safe — can be called from any thread.
 
 ### Error Codes
 
-| Code | Name           | Description                       |
-|------|----------------|-----------------------------------|
-| 0    | Ok             | Success                           |
-| -1   | NullPointer    | Null pointer argument             |
-| -2   | InvalidConfig  | Invalid configuration             |
-| -3   | InitFailed     | Engine initialization failed      |
-| -4   | InvalidUtf8    | Invalid UTF-8 string              |
-| -5   | BufferTooSmall | Output buffer too small           |
-| -6   | LoadFailed     | WAV file load failed              |
+| Code | Name               | Description                              |
+|------|--------------------|------------------------------------------|
+| 0    | Ok                 | Success                                  |
+| -1   | NullPointer        | Null pointer argument                    |
+| -2   | InvalidConfig      | Invalid configuration                    |
+| -3   | InitFailed         | Engine initialization failed             |
+| -4   | InvalidUtf8        | Invalid UTF-8 string                     |
+| -5   | BufferTooSmall     | Output buffer too small                  |
+| -6   | LoadFailed         | WAV file load failed                     |
+| -7   | LayerLimitExceeded | Layer index out of bounds                |
+| -8   | BaseRequired       | Texture/event requires base to be set    |
 
 ---
 
 ## Flutter Integration (Dart)
 
-### Loading the Library
+### Audio Data Flow
 
-```dart
-import 'dart:ffi';
-import 'package:ffi/ffi.dart';
-
-// Load the native library
-final DynamicLibrary nativeLib = Platform.isAndroid
-    ? DynamicLibrary.open('libhexatune_dsp_ffi.so')
-    : DynamicLibrary.process(); // iOS uses static linking
-
-// Bind functions
-typedef InitNative = Pointer<Void> Function(Pointer<HtdEngineConfig>, Pointer<Int32>);
-typedef InitDart = Pointer<Void> Function(Pointer<HtdEngineConfig>, Pointer<Int32>);
-
-final htdEngineInit = nativeLib.lookupFunction<InitNative, InitDart>('htd_engine_init');
 ```
+.m4a file -> Flutter decoder -> raw PCM f32 -> FFI -> Rust engine
+```
+
+Flutter decodes audio files to raw PCM f32 buffers, then passes them via FFI.
 
 ### Complete Dart Usage Example
 
@@ -332,62 +425,91 @@ final htdEngineInit = nativeLib.lookupFunction<InitNative, InitDart>('htd_engine
 import 'dart:ffi';
 import 'package:ffi/ffi.dart';
 
-void startBinauralSession() {
-  // 1. Build cycle items
+void startSoundscape() {
+  // 1. Build frequency cycle
   final cycleItems = calloc<HtdCycleItem>(3);
-  cycleItems[0].frequency_delta = 3.0;  // 3 Hz delta
-  cycleItems[0].duration_seconds = 30.0; // 30 seconds
-  cycleItems[1].frequency_delta = 4.0;
-  cycleItems[1].duration_seconds = 30.0;
-  cycleItems[2].frequency_delta = 5.0;
-  cycleItems[2].duration_seconds = 30.0;
+  cycleItems[0]
+    ..frequency_delta = 3.0
+    ..duration_seconds = 30.0;
+  cycleItems[1]
+    ..frequency_delta = 4.0
+    ..duration_seconds = 30.0;
+  cycleItems[2]
+    ..frequency_delta = 5.0
+    ..duration_seconds = 30.0;
 
   // 2. Build config
   final config = calloc<HtdEngineConfig>();
-  config.ref.carrier_frequency = 400.0;
-  config.ref.binaural_enabled = true;
-  config.ref.rain_sound_path = '/path/to/rain.wav'.toNativeUtf8().cast();
-  config.ref.cycle_items = cycleItems;
-  config.ref.cycle_count = 3;
-  config.ref.sample_rate = 48000.0;
-  config.ref.rain_gain = 0.8;
-  config.ref.tone_gain = 0.2;
+  config.ref
+    ..carrier_frequency = 400.0
+    ..binaural_enabled = true
+    ..cycle_items = cycleItems
+    ..cycle_count = 3
+    ..sample_rate = 48000.0
+    ..base_gain = 0.6
+    ..texture_gain = 0.3
+    ..event_gain = 0.4
+    ..binaural_gain = 0.15
+    ..master_gain = 1.0;
 
   // 3. Initialize engine
   final errorPtr = calloc<Int32>();
   final engine = htdEngineInit(config, errorPtr);
   if (engine == nullptr) {
-    print('Init failed with error: ${errorPtr.value}');
+    print('Init failed: ${errorPtr.value}');
     return;
   }
 
-  // 4. Start playback
+  // 4. Load layers (Flutter decodes .m4a to PCM f32 first)
+  final basePcm = decodeAudioToPcm('assets/rain_on_roof.m4a');
+  final baseConfig = calloc<HtdLayerConfig>();
+  baseConfig.ref
+    ..samples = basePcm.pointer
+    ..num_frames = basePcm.frameCount
+    ..channels = basePcm.channels;
+  htdEngineSetBase(engine, baseConfig);
+
+  // 5. Add a texture layer
+  final windPcm = decodeAudioToPcm('assets/distant_wind.m4a');
+  final textureConfig = calloc<HtdLayerConfig>();
+  textureConfig.ref
+    ..samples = windPcm.pointer
+    ..num_frames = windPcm.frameCount
+    ..channels = windPcm.channels;
+  htdEngineSetTexture(engine, 0, textureConfig);
+
+  // 6. Add a random event
+  final thunderPcm = decodeAudioToPcm('assets/distant_thunder.m4a');
+  final eventConfig = calloc<HtdEventConfig>();
+  eventConfig.ref
+    ..samples = thunderPcm.pointer
+    ..num_frames = thunderPcm.frameCount
+    ..channels = thunderPcm.channels
+    ..min_interval_ms = 40000
+    ..max_interval_ms = 120000
+    ..volume_min = 0.3
+    ..volume_max = 0.7
+    ..pan_min = -0.5
+    ..pan_max = 0.5;
+  htdEngineSetEvent(engine, 0, eventConfig);
+
+  // 7. Start playback
   htdEngineStart(engine);
 
-  // 5. In your audio callback, call render:
-  //    htdEngineRender(engine, outputBuffer, numFrames);
+  // 8. Adjust gains from UI:
+  htdEngineSetBinauralGain(engine, 0.2);
+  htdEngineSetBaseGain(engine, 0.7);
 
-  // 6. Adjust gains at any time from the UI thread:
-  htdEngineSetRainGain(engine, 0.6);
-  htdEngineSetToneGain(engine, 0.4);
-
-  // 7. When done:
+  // 9. Cleanup when done:
   htdEngineStop(engine);
+  htdEngineClearAllLayers(engine);
   htdEngineDestroy(engine);
-
-  // 8. Free native memory
-  calloc.free(config);
-  calloc.free(cycleItems);
-  calloc.free(errorPtr);
 }
 ```
 
 ### Audio Callback Integration
 
-In your Flutter audio plugin (e.g., `flutter_sound`, `miniaudio`, or a custom platform channel):
-
 ```dart
-// Called by the platform audio system for each buffer
 void audioCallback(Pointer<Float> buffer, int numFrames) {
   htdEngineRender(engine, buffer, numFrames);
 }
@@ -400,66 +522,74 @@ void audioCallback(Pointer<Float> buffer, int numFrames) {
 ```c
 #include "hexatune_dsp_ffi.h"
 #include <stdio.h>
-#include <stdlib.h>
 
 int main(void) {
-    // Define a frequency cycle: 3Hz→4Hz→5Hz, 30s each
+    // Frequency cycle: 3Hz->4Hz->5Hz, 30s each
     HtdCycleItem cycle[] = {
         { .frequency_delta = 3.0f, .duration_seconds = 30.0f },
         { .frequency_delta = 4.0f, .duration_seconds = 30.0f },
         { .frequency_delta = 5.0f, .duration_seconds = 30.0f },
     };
 
-    // Configure the engine
+    // Engine configuration
     HtdEngineConfig config = {
         .carrier_frequency = 400.0f,
         .binaural_enabled = true,
-        .rain_sound_path = "assets/rain.wav",  // or NULL for no rain
         .cycle_items = cycle,
         .cycle_count = 3,
         .sample_rate = 48000.0f,
-        .rain_gain = 0.8f,
-        .tone_gain = 0.2f,
+        .base_gain = 0.6f,
+        .texture_gain = 0.3f,
+        .event_gain = 0.4f,
+        .binaural_gain = 0.15f,
+        .master_gain = 1.0f,
     };
 
     // Initialize
     int32_t error = 0;
     HtdEngine *engine = htd_engine_init(&config, &error);
     if (!engine) {
-        fprintf(stderr, "Failed to init engine: %d\n", error);
+        fprintf(stderr, "Failed: %d\n", error);
         return 1;
     }
+
+    // Load base layer from WAV (convenience)
+    htd_engine_load_base_wav(engine, "assets/rain.wav");
+
+    // Or load from raw PCM:
+    // float pcm_data[] = { ... };
+    // HtdLayerConfig layer = { .samples = pcm_data, .num_frames = 48000, .channels = 2 };
+    // htd_engine_set_base(engine, &layer);
+
+    // Add a random event
+    float thunder[] = { /* decoded PCM */ };
+    HtdEventConfig evt = {
+        .samples = thunder,
+        .num_frames = 24000,
+        .channels = 1,
+        .min_interval_ms = 40000,
+        .max_interval_ms = 120000,
+        .volume_min = 0.3f,
+        .volume_max = 0.7f,
+        .pan_min = -0.5f,
+        .pan_max = 0.5f,
+    };
+    htd_engine_set_event(engine, 0, &evt);
 
     // Start
     htd_engine_start(engine);
 
-    // Render audio (call this from your audio callback)
-    float buffer[1024];  // 512 stereo frames
+    // Render (call from audio callback)
+    float buffer[1024];
     htd_engine_render(engine, buffer, 512);
 
     // Adjust gains at runtime
-    htd_engine_set_rain_gain(engine, 0.6f);
-    htd_engine_set_tone_gain(engine, 0.4f);
-
-    // Update cycle at runtime
-    HtdCycleItem new_cycle[] = {
-        { .frequency_delta = 6.0f, .duration_seconds = 60.0f },
-        { .frequency_delta = 8.0f, .duration_seconds = 60.0f },
-    };
-    HtdEngineConfig update = {
-        .carrier_frequency = 432.0f,
-        .binaural_enabled = true,
-        .rain_sound_path = NULL,
-        .cycle_items = new_cycle,
-        .cycle_count = 2,
-        .sample_rate = 0,      // ignored in update
-        .rain_gain = 0,        // ignored in update
-        .tone_gain = 0,        // ignored in update
-    };
-    htd_engine_update_config(engine, &update);
+    htd_engine_set_base_gain(engine, 0.7f);
+    htd_engine_set_binaural_gain(engine, 0.2f);
 
     // Cleanup
     htd_engine_stop(engine);
+    htd_engine_clear_all_layers(engine);
     htd_engine_destroy(engine);
     return 0;
 }
@@ -473,24 +603,24 @@ int main(void) {
 
 When `binaural_enabled = true`, the engine generates two sine waves:
 
-- **Left channel** = `sin(2π × carrier × t)`
-- **Right channel** = `sin(2π × (carrier + delta) × t)`
+- **Left channel** = `sin(2pi * carrier * t)`
+- **Right channel** = `sin(2pi * (carrier + delta) * t)`
 
-The listener perceives a "beat" at the delta frequency when using headphones. For example, with `carrier = 400 Hz` and `delta = 5 Hz`, the left ear hears 400 Hz and the right ear hears 405 Hz, producing a perceived 5 Hz binaural beat.
+The listener perceives a "beat" at the delta frequency when using headphones.
 
 ### AM Mode (Non-Binaural)
 
 When `binaural_enabled = false`, the engine generates a single carrier tone with amplitude modulation:
 
 ```
-output = sin(2π × carrier × t) × ((sin(2π × delta × t) + 1) / 2)
+output = sin(2pi * carrier * t) * ((sin(2pi * delta * t) + 1) / 2)
 ```
 
-This produces rhythmic pulsing at the delta frequency, output identically to both channels. Useful when the listener is not using headphones.
+This produces rhythmic pulsing at the delta frequency, output identically to both channels.
 
 ### Frequency Cycle Scheduling
 
-The engine cycles through a list of frequency deltas, each with a specified duration:
+The engine cycles through frequency deltas with sample-accurate timing:
 
 ```
 cycle = [
@@ -500,30 +630,36 @@ cycle = [
 ]
 ```
 
-Playback:
-1. First 30 seconds → 400 / 403 Hz (3 Hz delta)
-2. Next 30 seconds → 400 / 404 Hz (4 Hz delta)
-3. Next 30 seconds → 400 / 405 Hz (5 Hz delta)
-4. Loop back to step 1
+Phase is preserved across delta changes to avoid clicks.
 
-Transitions are sample-accurate (no timer jitter). Phase is preserved across delta changes to avoid clicks.
+### Layer System
 
-### Rain / Ambient Sound
+| Layer    | Count  | Behavior                        | Gain Default |
+|----------|--------|---------------------------------|--------------|
+| Base     | 0-1    | Continuous loop with crossfade  | 0.6          |
+| Texture  | 0-3    | Continuous loops, summed        | 0.3          |
+| Event    | 0-5    | Random one-shots (max 1 active) | 0.4          |
+| Binaural | always | Sine tone (binaural or AM)      | 0.15         |
+| Master   | -      | Scales final output             | 1.0          |
 
-- WAV files (16-bit int or 32-bit float, mono or stereo) are loaded into memory before playback
-- Playback loops seamlessly
-- The rain buffer is pre-allocated — zero allocations during render
+**Validation rules:**
+- Texture and event layers require a base layer to be set.
+- Clearing the base also clears all textures and events.
+- The binaural layer is independent and always available.
+
+**Loop crossfade:** SamplePlayer uses a configurable crossfade region (default 2048 frames, approx 42 ms at 48 kHz). At the loop boundary, the tail blends linearly with the head to eliminate clicks.
+
+**Event scheduling:** Uses a Xorshift64 PRNG for sample-accurate random intervals. Each event has configurable min/max interval, volume range, and pan range. At trigger time, volume and pan are randomized within the configured ranges.
 
 ### Mixer
 
-The final output combines tone and rain with configurable gains:
+The mixer combines all layers with per-layer gains:
 
 ```
-left  = rain_left  × rain_gain + tone_left  × tone_gain
-right = rain_right × rain_gain + tone_right × tone_gain
+output = (base * base_gain + textures * texture_gain + events * event_gain + binaural * binaural_gain) * master_gain
 ```
 
-Default gains: `rain_gain = 0.8`, `tone_gain = 0.2`. Output is clamped to `[-1.0, 1.0]`.
+Output is clamped to `[-1.0, 1.0]`.
 
 ---
 
@@ -537,7 +673,7 @@ The `htd_engine_render` function is designed for audio callbacks. Inside the ren
 - Acquire blocking locks (uses `try_lock` for config updates)
 - Call any blocking OS API
 
-All assets (WAV files, cycle arrays) must be loaded before calling `htd_engine_start`. Gain updates use lock-free atomics. Config updates use a non-blocking `try_lock` — if contended, the update is deferred to the next render call.
+All audio buffers must be loaded before or between render calls. Gain updates use lock-free atomics. Config updates use a non-blocking `try_lock` — if contended, the update is deferred to the next render call.
 
 ---
 
@@ -546,29 +682,16 @@ All assets (WAV files, cycle arrays) must be loaded before calling `htd_engine_s
 ### Android (via cargo-ndk)
 
 ```bash
-# Install targets
 rustup target add aarch64-linux-android armv7-linux-androideabi x86_64-linux-android
-
-# Build
 cargo ndk -t arm64-v8a -t armeabi-v7a -t x86_64 build --release
 ```
 
-Copy the `.so` files into your Flutter project:
-
-```
-android/app/src/main/jniLibs/
-├── arm64-v8a/libhexatune_dsp_ffi.so
-├── armeabi-v7a/libhexatune_dsp_ffi.so
-└── x86_64/libhexatune_dsp_ffi.so
-```
+Copy `.so` files to `android/app/src/main/jniLibs/`.
 
 ### iOS
 
 ```bash
-# Install targets
 rustup target add aarch64-apple-ios aarch64-apple-ios-sim
-
-# Build
 cargo build --release --target aarch64-apple-ios
 cargo build --release --target aarch64-apple-ios-sim
 ```
