@@ -17,7 +17,7 @@ use crate::mixer::{
     DEFAULT_TEXTURE_GAIN, LayerGains, Mixer,
 };
 use crate::sample_player::SamplePlayer;
-use crate::scheduler::{CycleItem, Scheduler};
+use crate::scheduler::{AdvanceResult, CycleItem, Scheduler};
 
 /// Default sample rate for mobile audio.
 pub const DEFAULT_SAMPLE_RATE: f32 = 48000.0;
@@ -55,6 +55,8 @@ pub struct Engine {
     scheduler: Scheduler,
     mixer: Mixer,
     sample_rate: f32,
+    /// Set when all cycle items are exhausted (all oneshot, past first iter).
+    binaural_muted: bool,
 
     // -- Atomic shared parameters (written by control, read by audio) --
     base_gain: AtomicU32,
@@ -63,6 +65,8 @@ pub struct Engine {
     binaural_gain: AtomicU32,
     master_gain: AtomicU32,
     running: AtomicBool,
+    /// Atomic flag for graceful stop request from control thread.
+    graceful_stop_requested: AtomicBool,
 
     // -- Pending configuration (written by control, consumed by audio) --
     pending_config: Mutex<Option<PendingConfig>>,
@@ -95,14 +99,17 @@ impl Default for EngineConfig {
                 CycleItem {
                     frequency_delta: 3.0,
                     duration_seconds: 30.0,
+                    oneshot: false,
                 },
                 CycleItem {
                     frequency_delta: 4.0,
                     duration_seconds: 30.0,
+                    oneshot: false,
                 },
                 CycleItem {
                     frequency_delta: 5.0,
                     duration_seconds: 30.0,
+                    oneshot: false,
                 },
             ],
             sample_rate: DEFAULT_SAMPLE_RATE,
@@ -152,12 +159,14 @@ impl Engine {
             scheduler,
             mixer,
             sample_rate: config.sample_rate,
+            binaural_muted: false,
             base_gain: AtomicU32::new(config.base_gain.to_bits()),
             texture_gain: AtomicU32::new(config.texture_gain.to_bits()),
             event_gain: AtomicU32::new(config.event_gain.to_bits()),
             binaural_gain: AtomicU32::new(config.binaural_gain.to_bits()),
             master_gain: AtomicU32::new(config.master_gain.to_bits()),
             running: AtomicBool::new(false),
+            graceful_stop_requested: AtomicBool::new(false),
             pending_config: Mutex::new(None),
         })
     }
@@ -166,12 +175,22 @@ impl Engine {
 
     /// Mark the engine as running. Audio will be generated in [`render`].
     pub fn start(&self) {
+        self.graceful_stop_requested.store(false, Ordering::Release);
         self.running.store(true, Ordering::Release);
     }
 
     /// Mark the engine as stopped. [`render`] will output silence.
     pub fn stop(&self) {
+        self.graceful_stop_requested.store(false, Ordering::Release);
         self.running.store(false, Ordering::Release);
+    }
+
+    /// Request a graceful stop: the engine continues playing until the
+    /// current cycle iteration completes, then stops automatically.
+    /// The scheduler's `stop_at_cycle_end` flag is set via an atomic bool
+    /// and applied on the next render call.
+    pub fn stop_graceful(&self) {
+        self.graceful_stop_requested.store(true, Ordering::Release);
     }
 
     /// Whether the engine is currently running.
@@ -349,14 +368,43 @@ impl Engine {
         }
 
         for i in 0..num_frames {
-            // 1. Frequency scheduler update
-            if self.scheduler.advance() {
-                let new_delta = self.scheduler.current_delta();
-                self.binaural.set_delta(new_delta);
+            // 1. Apply graceful stop flag from control thread
+            if self
+                .graceful_stop_requested
+                .compare_exchange(true, false, Ordering::Acquire, Ordering::Relaxed)
+                .is_ok()
+            {
+                self.scheduler.set_stop_at_cycle_end(true);
             }
 
-            // 2. Generate binaural/AM tone
-            let tone = self.binaural.generate();
+            // 2. Frequency scheduler update
+            match self.scheduler.advance() {
+                AdvanceResult::ItemChanged => {
+                    let new_delta = self.scheduler.current_delta();
+                    self.binaural.set_delta(new_delta);
+                }
+                AdvanceResult::AllExhausted => {
+                    self.binaural_muted = true;
+                }
+                AdvanceResult::CycleCompleteStop => {
+                    self.running.store(false, Ordering::Release);
+                    // Fill remaining frames with silence and return
+                    for j in i..num_frames {
+                        let idx = j * 2;
+                        output[idx] = 0.0;
+                        output[idx + 1] = 0.0;
+                    }
+                    return;
+                }
+                AdvanceResult::NoChange => {}
+            }
+
+            // 3. Generate binaural/AM tone (silent if exhausted)
+            let tone = if self.binaural_muted {
+                StereoSample::default()
+            } else {
+                self.binaural.generate()
+            };
 
             // 3. Base layer
             let base = match self.base_layer.as_mut() {
@@ -405,6 +453,7 @@ impl Engine {
             }
             if let Some(items) = config.cycle_items {
                 self.scheduler.set_items(items);
+                self.binaural_muted = false;
                 let new_delta = self.scheduler.current_delta();
                 self.binaural.set_delta(new_delta);
             }
@@ -445,10 +494,12 @@ mod tests {
                 CycleItem {
                     frequency_delta: 3.0,
                     duration_seconds: 0.01,
+                    oneshot: false,
                 },
                 CycleItem {
                     frequency_delta: 5.0,
                     duration_seconds: 0.01,
+                    oneshot: false,
                 },
             ],
             sample_rate: 48000.0,

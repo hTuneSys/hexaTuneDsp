@@ -171,8 +171,14 @@ A single step in the frequency cycle.
 typedef struct HtdCycleItem {
     float frequency_delta;    // Hz delta added to carrier
     float duration_seconds;   // How long this step lasts
+    bool oneshot;             // If true, plays only in the first cycle iteration
 } HtdCycleItem;
 ```
+
+**One-shot items:** When `oneshot` is `true`, the item plays during the first
+pass through the cycle and is skipped on all subsequent iterations. If every
+item in the cycle is one-shot, the binaural/tone layer goes silent after the
+first pass while ambience layers continue playing.
 
 #### `HtdEngineConfig`
 
@@ -256,10 +262,19 @@ int32_t htd_engine_start(HtdEngine *engine);  // Returns 0 on success
 
 #### `htd_engine_stop`
 
-Stop audio generation. Render will output silence.
+Stop audio generation immediately. Render will output silence.
 
 ```c
 int32_t htd_engine_stop(HtdEngine *engine);  // Returns 0 on success
+```
+
+#### `htd_engine_stop_graceful`
+
+Request a graceful stop. The engine finishes playing all remaining items in the
+current cycle iteration, then automatically stops (including all layers).
+
+```c
+int32_t htd_engine_stop_graceful(HtdEngine *engine);  // Returns 0 on success
 ```
 
 #### `htd_engine_is_running`
@@ -430,13 +445,16 @@ void startSoundscape() {
   final cycleItems = calloc<HtdCycleItem>(3);
   cycleItems[0]
     ..frequency_delta = 3.0
-    ..duration_seconds = 30.0;
+    ..duration_seconds = 30.0
+    ..oneshot = false;
   cycleItems[1]
     ..frequency_delta = 4.0
-    ..duration_seconds = 30.0;
+    ..duration_seconds = 30.0
+    ..oneshot = true;   // plays only in the first cycle pass
   cycleItems[2]
     ..frequency_delta = 5.0
-    ..duration_seconds = 30.0;
+    ..duration_seconds = 30.0
+    ..oneshot = false;
 
   // 2. Build config
   final config = calloc<HtdEngineConfig>();
@@ -524,11 +542,11 @@ void audioCallback(Pointer<Float> buffer, int numFrames) {
 #include <stdio.h>
 
 int main(void) {
-    // Frequency cycle: 3Hz->4Hz->5Hz, 30s each
+    // Frequency cycle: 3Hz->4Hz->5Hz, 30s each; 4Hz is one-shot
     HtdCycleItem cycle[] = {
-        { .frequency_delta = 3.0f, .duration_seconds = 30.0f },
-        { .frequency_delta = 4.0f, .duration_seconds = 30.0f },
-        { .frequency_delta = 5.0f, .duration_seconds = 30.0f },
+        { .frequency_delta = 3.0f, .duration_seconds = 30.0f, .oneshot = false },
+        { .frequency_delta = 4.0f, .duration_seconds = 30.0f, .oneshot = true  },
+        { .frequency_delta = 5.0f, .duration_seconds = 30.0f, .oneshot = false },
     };
 
     // Engine configuration
@@ -587,8 +605,10 @@ int main(void) {
     htd_engine_set_base_gain(engine, 0.7f);
     htd_engine_set_binaural_gain(engine, 0.2f);
 
-    // Cleanup
-    htd_engine_stop(engine);
+    // Cleanup — use stop_graceful to finish the current cycle first,
+    // or stop for an immediate halt.
+    htd_engine_stop_graceful(engine);  // finishes current cycle, then stops
+    // htd_engine_stop(engine);        // alternative: immediate stop
     htd_engine_clear_all_layers(engine);
     htd_engine_destroy(engine);
     return 0;
