@@ -69,9 +69,7 @@ impl EventSystem {
         pan_max: f32,
     ) -> Result<(), String> {
         if index >= MAX_EVENT_SLOTS {
-            return Err(format!(
-                "event index {index} exceeds max {MAX_EVENT_SLOTS}"
-            ));
+            return Err(format!("event index {index} exceeds max {MAX_EVENT_SLOTS}"));
         }
         if samples.is_empty() {
             return Err("event samples are empty".to_string());

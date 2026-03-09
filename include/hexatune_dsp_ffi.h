@@ -82,6 +82,10 @@ typedef struct Engine HtdEngine;
 typedef struct HtdCycleItem {
   float frequency_delta;
   float duration_seconds;
+  /**
+   * If true, this item plays only in the first cycle iteration.
+   */
+  bool oneshot;
 } HtdCycleItem;
 
 /**
@@ -215,6 +219,19 @@ int32_t htd_engine_start(HtdEngine *engine);
  * `engine` must be a valid engine pointer.
  */
 int32_t htd_engine_stop(HtdEngine *engine);
+
+/**
+ * Request a graceful stop: the engine finishes the current cycle iteration
+ * (all remaining items in this pass) and then automatically stops.
+ *
+ * Ambience, texture, and event layers will also go silent once the cycle
+ * completes.
+ *
+ * # Safety
+ *
+ * `engine` must be a valid engine pointer.
+ */
+int32_t htd_engine_stop_graceful(HtdEngine *engine);
 
 /**
  * Render `num_frames` of interleaved stereo f32 audio into `output`.

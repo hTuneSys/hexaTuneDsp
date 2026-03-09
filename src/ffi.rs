@@ -42,6 +42,8 @@ pub type HtdEngine = Engine;
 pub struct HtdCycleItem {
     pub frequency_delta: f32,
     pub duration_seconds: f32,
+    /// If true, this item plays only in the first cycle iteration.
+    pub oneshot: bool,
 }
 
 /// Engine configuration passed from Flutter.
@@ -138,6 +140,7 @@ unsafe fn ffi_config_to_rust(config: *const HtdEngineConfig) -> Result<EngineCon
             .map(|item| CycleItem {
                 frequency_delta: item.frequency_delta,
                 duration_seconds: item.duration_seconds,
+                oneshot: item.oneshot,
             })
             .collect()
     };
@@ -270,6 +273,24 @@ pub unsafe extern "C" fn htd_engine_stop(engine: *mut HtdEngine) -> i32 {
         return HtdError::NullPointer as i32;
     }
     unsafe { &*engine }.stop();
+    HtdError::Ok as i32
+}
+
+/// Request a graceful stop: the engine finishes the current cycle iteration
+/// (all remaining items in this pass) and then automatically stops.
+///
+/// Ambience, texture, and event layers will also go silent once the cycle
+/// completes.
+///
+/// # Safety
+///
+/// `engine` must be a valid engine pointer.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn htd_engine_stop_graceful(engine: *mut HtdEngine) -> i32 {
+    if engine.is_null() {
+        return HtdError::NullPointer as i32;
+    }
+    unsafe { &*engine }.stop_graceful();
     HtdError::Ok as i32
 }
 
@@ -603,6 +624,7 @@ pub unsafe extern "C" fn htd_engine_update_config(
                 .map(|item| CycleItem {
                     frequency_delta: item.frequency_delta,
                     duration_seconds: item.duration_seconds,
+                    oneshot: item.oneshot,
                 })
                 .collect(),
         )
