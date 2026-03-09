@@ -23,8 +23,10 @@
 use std::ffi::CStr;
 use std::os::raw::c_char;
 
-use crate::engine::{
-    DEFAULT_RAIN_GAIN, DEFAULT_SAMPLE_RATE, DEFAULT_TONE_GAIN, Engine, EngineConfig, PendingConfig,
+use crate::engine::{DEFAULT_SAMPLE_RATE, Engine, EngineConfig, PendingConfig};
+use crate::mixer::{
+    DEFAULT_BASE_GAIN, DEFAULT_BINAURAL_GAIN, DEFAULT_EVENT_GAIN, DEFAULT_MASTER_GAIN,
+    DEFAULT_TEXTURE_GAIN,
 };
 use crate::scheduler::CycleItem;
 
@@ -40,6 +42,8 @@ pub type HtdEngine = Engine;
 pub struct HtdCycleItem {
     pub frequency_delta: f32,
     pub duration_seconds: f32,
+    /// If true, this item plays only in the first cycle iteration.
+    pub oneshot: bool,
 }
 
 /// Engine configuration passed from Flutter.
@@ -47,15 +51,50 @@ pub struct HtdCycleItem {
 pub struct HtdEngineConfig {
     pub carrier_frequency: f32,
     pub binaural_enabled: bool,
-    /// Null-terminated UTF-8 path, or null if no rain sound.
-    pub rain_sound_path: *const c_char,
     /// Pointer to an array of cycle items.
     pub cycle_items: *const HtdCycleItem,
     /// Number of cycle items.
     pub cycle_count: u32,
     pub sample_rate: f32,
-    pub rain_gain: f32,
-    pub tone_gain: f32,
+    pub base_gain: f32,
+    pub texture_gain: f32,
+    pub event_gain: f32,
+    pub binaural_gain: f32,
+    pub master_gain: f32,
+}
+
+/// Audio layer configuration (raw PCM data).
+#[repr(C)]
+pub struct HtdLayerConfig {
+    /// Pointer to interleaved f32 PCM samples.
+    pub samples: *const f32,
+    /// Number of sample frames (not individual samples).
+    pub num_frames: u32,
+    /// Number of channels: 1 (mono) or 2 (stereo interleaved).
+    pub channels: u32,
+}
+
+/// Random event configuration.
+#[repr(C)]
+pub struct HtdEventConfig {
+    /// Pointer to interleaved f32 PCM samples.
+    pub samples: *const f32,
+    /// Number of sample frames.
+    pub num_frames: u32,
+    /// Number of channels: 1 (mono) or 2 (stereo interleaved).
+    pub channels: u32,
+    /// Minimum interval between triggers in milliseconds.
+    pub min_interval_ms: u32,
+    /// Maximum interval between triggers in milliseconds.
+    pub max_interval_ms: u32,
+    /// Minimum playback volume (0.0–1.0).
+    pub volume_min: f32,
+    /// Maximum playback volume (0.0–1.0).
+    pub volume_max: f32,
+    /// Minimum stereo pan (-1.0 = left, 1.0 = right).
+    pub pan_min: f32,
+    /// Maximum stereo pan (-1.0 = left, 1.0 = right).
+    pub pan_max: f32,
 }
 
 /// A stereo audio frame (used for documentation / cbindgen export).
@@ -69,20 +108,15 @@ pub struct HtdStereoFrame {
 #[repr(i32)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HtdError {
-    /// Operation succeeded.
     Ok = 0,
-    /// Null pointer argument.
     NullPointer = -1,
-    /// Invalid configuration.
     InvalidConfig = -2,
-    /// Engine initialization failed.
     InitFailed = -3,
-    /// Invalid UTF-8 string.
     InvalidUtf8 = -4,
-    /// Buffer too small.
     BufferTooSmall = -5,
-    /// WAV file load failed.
     LoadFailed = -6,
+    LayerLimitExceeded = -7,
+    BaseRequired = -8,
 }
 
 // ---------------------------------------------------------------------------
@@ -96,13 +130,6 @@ unsafe fn ffi_config_to_rust(config: *const HtdEngineConfig) -> Result<EngineCon
 
     let cfg = unsafe { &*config };
 
-    let rain_sound_path = if cfg.rain_sound_path.is_null() {
-        None
-    } else {
-        let cstr = unsafe { CStr::from_ptr(cfg.rain_sound_path) };
-        Some(cstr.to_str().map_err(|_| HtdError::InvalidUtf8)?.to_owned())
-    };
-
     let cycle_items = if cfg.cycle_items.is_null() || cfg.cycle_count == 0 {
         Vec::new()
     } else {
@@ -113,6 +140,7 @@ unsafe fn ffi_config_to_rust(config: *const HtdEngineConfig) -> Result<EngineCon
             .map(|item| CycleItem {
                 frequency_delta: item.frequency_delta,
                 duration_seconds: item.duration_seconds,
+                oneshot: item.oneshot,
             })
             .collect()
     };
@@ -123,31 +151,47 @@ unsafe fn ffi_config_to_rust(config: *const HtdEngineConfig) -> Result<EngineCon
         DEFAULT_SAMPLE_RATE
     };
 
-    let rain_gain = if cfg.rain_gain >= 0.0 {
-        cfg.rain_gain
+    let base_gain = if cfg.base_gain >= 0.0 {
+        cfg.base_gain
     } else {
-        DEFAULT_RAIN_GAIN
+        DEFAULT_BASE_GAIN
     };
-
-    let tone_gain = if cfg.tone_gain >= 0.0 {
-        cfg.tone_gain
+    let texture_gain = if cfg.texture_gain >= 0.0 {
+        cfg.texture_gain
     } else {
-        DEFAULT_TONE_GAIN
+        DEFAULT_TEXTURE_GAIN
+    };
+    let event_gain = if cfg.event_gain >= 0.0 {
+        cfg.event_gain
+    } else {
+        DEFAULT_EVENT_GAIN
+    };
+    let binaural_gain = if cfg.binaural_gain >= 0.0 {
+        cfg.binaural_gain
+    } else {
+        DEFAULT_BINAURAL_GAIN
+    };
+    let master_gain = if cfg.master_gain >= 0.0 {
+        cfg.master_gain
+    } else {
+        DEFAULT_MASTER_GAIN
     };
 
     Ok(EngineConfig {
         carrier_frequency: cfg.carrier_frequency,
         binaural_enabled: cfg.binaural_enabled,
-        rain_sound_path,
         cycle_items,
         sample_rate,
-        rain_gain,
-        tone_gain,
+        base_gain,
+        texture_gain,
+        event_gain,
+        binaural_gain,
+        master_gain,
     })
 }
 
 // ---------------------------------------------------------------------------
-// FFI functions
+// FFI functions — Lifecycle
 // ---------------------------------------------------------------------------
 
 /// Initialize the DSP engine with the given configuration.
@@ -204,8 +248,7 @@ pub unsafe extern "C" fn htd_engine_destroy(engine: *mut HtdEngine) {
     }
 }
 
-/// Start audio generation. After this call, [`htd_engine_render`] will
-/// produce audio samples instead of silence.
+/// Start audio generation.
 ///
 /// # Safety
 ///
@@ -233,15 +276,33 @@ pub unsafe extern "C" fn htd_engine_stop(engine: *mut HtdEngine) -> i32 {
     HtdError::Ok as i32
 }
 
-/// Render `num_frames` of interleaved stereo f32 audio into `output`.
+/// Request a graceful stop: the engine finishes the current cycle iteration
+/// (all remaining items in this pass) and then automatically stops.
 ///
-/// The output buffer must hold at least `num_frames * 2` floats
-/// (left, right, left, right, ...).
+/// Ambience, texture, and event layers will also go silent once the cycle
+/// completes.
+///
+/// # Safety
+///
+/// `engine` must be a valid engine pointer.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn htd_engine_stop_graceful(engine: *mut HtdEngine) -> i32 {
+    if engine.is_null() {
+        return HtdError::NullPointer as i32;
+    }
+    unsafe { &*engine }.stop_graceful();
+    HtdError::Ok as i32
+}
+
+// ---------------------------------------------------------------------------
+// FFI functions — Render
+// ---------------------------------------------------------------------------
+
+/// Render `num_frames` of interleaved stereo f32 audio into `output`.
 ///
 /// # Real-time safety
 ///
-/// This function is safe to call from an audio callback. It does not
-/// allocate, does not perform I/O, and does not block.
+/// Safe to call from an audio callback.
 ///
 /// # Safety
 ///
@@ -266,45 +327,273 @@ pub unsafe extern "C" fn htd_engine_render(
     HtdError::Ok as i32
 }
 
-/// Set the rain/ambient gain level. Can be called from any thread.
+// ---------------------------------------------------------------------------
+// FFI functions — Layer management
+// ---------------------------------------------------------------------------
+
+/// Set the base ambient layer from raw PCM data.
+///
+/// # Safety
+///
+/// - `engine` must be a valid engine pointer.
+/// - `config` must point to a valid `HtdLayerConfig` with valid `samples`.
+/// - Must not be called concurrently with [`htd_engine_render`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn htd_engine_set_base(
+    engine: *mut HtdEngine,
+    config: *const HtdLayerConfig,
+) -> i32 {
+    if engine.is_null() || config.is_null() {
+        return HtdError::NullPointer as i32;
+    }
+
+    let cfg = unsafe { &*config };
+    if cfg.samples.is_null() || cfg.num_frames == 0 {
+        return HtdError::InvalidConfig as i32;
+    }
+
+    let total_samples = cfg.num_frames as usize * cfg.channels as usize;
+    let data = unsafe { std::slice::from_raw_parts(cfg.samples, total_samples) };
+    let engine = unsafe { &mut *engine };
+
+    match engine.set_base_layer(data, cfg.channels) {
+        Ok(()) => HtdError::Ok as i32,
+        Err(_) => HtdError::InvalidConfig as i32,
+    }
+}
+
+/// Remove the base layer and all dependent layers (textures, events).
+///
+/// # Safety
+///
+/// `engine` must be a valid engine pointer.
+/// Must not be called concurrently with [`htd_engine_render`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn htd_engine_clear_base(engine: *mut HtdEngine) -> i32 {
+    if engine.is_null() {
+        return HtdError::NullPointer as i32;
+    }
+    unsafe { &mut *engine }.clear_base_layer();
+    HtdError::Ok as i32
+}
+
+/// Set a texture layer at the given index (0–2).
+///
+/// # Safety
+///
+/// - `engine` must be a valid engine pointer.
+/// - `config` must point to valid `HtdLayerConfig`.
+/// - Must not be called concurrently with [`htd_engine_render`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn htd_engine_set_texture(
+    engine: *mut HtdEngine,
+    index: u32,
+    config: *const HtdLayerConfig,
+) -> i32 {
+    if engine.is_null() || config.is_null() {
+        return HtdError::NullPointer as i32;
+    }
+
+    let cfg = unsafe { &*config };
+    if cfg.samples.is_null() || cfg.num_frames == 0 {
+        return HtdError::InvalidConfig as i32;
+    }
+
+    let total_samples = cfg.num_frames as usize * cfg.channels as usize;
+    let data = unsafe { std::slice::from_raw_parts(cfg.samples, total_samples) };
+    let engine = unsafe { &mut *engine };
+
+    match engine.set_texture_layer(index as usize, data, cfg.channels) {
+        Ok(()) => HtdError::Ok as i32,
+        Err(e) => {
+            if e.contains("base") {
+                HtdError::BaseRequired as i32
+            } else {
+                HtdError::LayerLimitExceeded as i32
+            }
+        }
+    }
+}
+
+/// Remove a texture layer at the given index.
+///
+/// # Safety
+///
+/// `engine` must be a valid engine pointer.
+/// Must not be called concurrently with [`htd_engine_render`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn htd_engine_clear_texture(engine: *mut HtdEngine, index: u32) -> i32 {
+    if engine.is_null() {
+        return HtdError::NullPointer as i32;
+    }
+    unsafe { &mut *engine }.clear_texture_layer(index as usize);
+    HtdError::Ok as i32
+}
+
+/// Register a random event at the given index (0–4).
+///
+/// # Safety
+///
+/// - `engine` must be a valid engine pointer.
+/// - `config` must point to valid `HtdEventConfig`.
+/// - Must not be called concurrently with [`htd_engine_render`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn htd_engine_set_event(
+    engine: *mut HtdEngine,
+    index: u32,
+    config: *const HtdEventConfig,
+) -> i32 {
+    if engine.is_null() || config.is_null() {
+        return HtdError::NullPointer as i32;
+    }
+
+    let cfg = unsafe { &*config };
+    if cfg.samples.is_null() || cfg.num_frames == 0 {
+        return HtdError::InvalidConfig as i32;
+    }
+
+    let total_samples = cfg.num_frames as usize * cfg.channels as usize;
+    let data = unsafe { std::slice::from_raw_parts(cfg.samples, total_samples) };
+    let engine = unsafe { &mut *engine };
+
+    match engine.set_event(
+        index as usize,
+        data,
+        cfg.channels,
+        cfg.min_interval_ms,
+        cfg.max_interval_ms,
+        cfg.volume_min,
+        cfg.volume_max,
+        cfg.pan_min,
+        cfg.pan_max,
+    ) {
+        Ok(()) => HtdError::Ok as i32,
+        Err(e) => {
+            if e.contains("base") {
+                HtdError::BaseRequired as i32
+            } else {
+                HtdError::LayerLimitExceeded as i32
+            }
+        }
+    }
+}
+
+/// Remove a random event at the given index.
+///
+/// # Safety
+///
+/// `engine` must be a valid engine pointer.
+/// Must not be called concurrently with [`htd_engine_render`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn htd_engine_clear_event(engine: *mut HtdEngine, index: u32) -> i32 {
+    if engine.is_null() {
+        return HtdError::NullPointer as i32;
+    }
+    unsafe { &mut *engine }.clear_event(index as usize);
+    HtdError::Ok as i32
+}
+
+/// Remove all layers (base, textures, events). Binaural is unaffected.
+///
+/// # Safety
+///
+/// `engine` must be a valid engine pointer.
+/// Must not be called concurrently with [`htd_engine_render`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn htd_engine_clear_all_layers(engine: *mut HtdEngine) -> i32 {
+    if engine.is_null() {
+        return HtdError::NullPointer as i32;
+    }
+    unsafe { &mut *engine }.clear_all_layers();
+    HtdError::Ok as i32
+}
+
+// ---------------------------------------------------------------------------
+// FFI functions — Gain control
+// ---------------------------------------------------------------------------
+
+/// Set the base layer gain. Thread-safe (atomic).
 ///
 /// # Safety
 ///
 /// `engine` must be a valid engine pointer.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn htd_engine_set_rain_gain(engine: *mut HtdEngine, gain: f32) -> i32 {
+pub unsafe extern "C" fn htd_engine_set_base_gain(engine: *mut HtdEngine, gain: f32) -> i32 {
     if engine.is_null() {
         return HtdError::NullPointer as i32;
     }
-    unsafe { &*engine }.set_rain_gain(gain);
+    unsafe { &*engine }.set_base_gain(gain);
     HtdError::Ok as i32
 }
 
-/// Set the tone gain level. Can be called from any thread.
+/// Set the texture layer gain. Thread-safe (atomic).
 ///
 /// # Safety
 ///
 /// `engine` must be a valid engine pointer.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn htd_engine_set_tone_gain(engine: *mut HtdEngine, gain: f32) -> i32 {
+pub unsafe extern "C" fn htd_engine_set_texture_gain(engine: *mut HtdEngine, gain: f32) -> i32 {
     if engine.is_null() {
         return HtdError::NullPointer as i32;
     }
-    unsafe { &*engine }.set_tone_gain(gain);
+    unsafe { &*engine }.set_texture_gain(gain);
     HtdError::Ok as i32
 }
 
-/// Update the engine configuration at runtime. Changes are applied on the
-/// next render call. This function may be called from any thread.
+/// Set the event layer gain. Thread-safe (atomic).
 ///
-/// Fields in the config are applied as follows:
+/// # Safety
+///
+/// `engine` must be a valid engine pointer.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn htd_engine_set_event_gain(engine: *mut HtdEngine, gain: f32) -> i32 {
+    if engine.is_null() {
+        return HtdError::NullPointer as i32;
+    }
+    unsafe { &*engine }.set_event_gain(gain);
+    HtdError::Ok as i32
+}
+
+/// Set the binaural/tone layer gain. Thread-safe (atomic).
+///
+/// # Safety
+///
+/// `engine` must be a valid engine pointer.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn htd_engine_set_binaural_gain(engine: *mut HtdEngine, gain: f32) -> i32 {
+    if engine.is_null() {
+        return HtdError::NullPointer as i32;
+    }
+    unsafe { &*engine }.set_binaural_gain(gain);
+    HtdError::Ok as i32
+}
+
+/// Set the master output gain. Thread-safe (atomic).
+///
+/// # Safety
+///
+/// `engine` must be a valid engine pointer.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn htd_engine_set_master_gain(engine: *mut HtdEngine, gain: f32) -> i32 {
+    if engine.is_null() {
+        return HtdError::NullPointer as i32;
+    }
+    unsafe { &*engine }.set_master_gain(gain);
+    HtdError::Ok as i32
+}
+
+// ---------------------------------------------------------------------------
+// FFI functions — Config & query
+// ---------------------------------------------------------------------------
+
+/// Update the engine binaural configuration at runtime.
+///
+/// Fields applied:
 /// - `carrier_frequency`: updated if > 0
 /// - `binaural_enabled`: always applied
-/// - `cycle_items` / `cycle_count`: updated if `cycle_items` is non-null
-///   and `cycle_count` > 0
+/// - `cycle_items` / `cycle_count`: updated if non-null and count > 0
 ///
-/// `rain_sound_path`, `sample_rate`, and gain fields are ignored.
-/// Use dedicated setters for gains.
+/// Gain fields and `sample_rate` are ignored — use dedicated setters.
 ///
 /// # Safety
 ///
@@ -335,6 +624,7 @@ pub unsafe extern "C" fn htd_engine_update_config(
                 .map(|item| CycleItem {
                     frequency_delta: item.frequency_delta,
                     duration_seconds: item.duration_seconds,
+                    oneshot: item.oneshot,
                 })
                 .collect(),
         )
@@ -353,10 +643,9 @@ pub unsafe extern "C" fn htd_engine_update_config(
     HtdError::Ok as i32
 }
 
-/// Load a rain/ambient sound from a WAV file.
+/// Load a base layer from a WAV file (convenience function).
 ///
-/// This function allocates memory and performs I/O. It must NOT be called
-/// from an audio callback.
+/// This allocates memory and performs I/O.
 ///
 /// # Safety
 ///
@@ -364,7 +653,10 @@ pub unsafe extern "C" fn htd_engine_update_config(
 /// - `path` must be a valid null-terminated UTF-8 string.
 /// - Must not be called concurrently with [`htd_engine_render`].
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn htd_engine_load_rain(engine: *mut HtdEngine, path: *const c_char) -> i32 {
+pub unsafe extern "C" fn htd_engine_load_base_wav(
+    engine: *mut HtdEngine,
+    path: *const c_char,
+) -> i32 {
     if engine.is_null() || path.is_null() {
         return HtdError::NullPointer as i32;
     }
@@ -376,7 +668,7 @@ pub unsafe extern "C" fn htd_engine_load_rain(engine: *mut HtdEngine, path: *con
     };
 
     let engine = unsafe { &mut *engine };
-    match engine.load_rain_sound(path_str) {
+    match engine.load_base_wav(path_str) {
         Ok(()) => HtdError::Ok as i32,
         Err(_) => HtdError::LoadFailed as i32,
     }
